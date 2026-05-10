@@ -54,7 +54,7 @@ import re
 from ai_missions import setup_ai_missions, ai_mission_task
 from shadow_ai import (
     handle_mention, setup_shadow_ai,
-    ensure_plan_ttl_index, gas_set_tokens, gas_get_tokens,
+    ensure_plan_ttl_index, d1_set_tokens, d1_get_tokens,
     STARTING_TOKENS, LINKED_BONUS,
     # Ghost Guide
     ghost_send_welcome, ghost_handle_dm, ghost_is_active,
@@ -405,20 +405,21 @@ def calculate_session_echoes(duration_seconds: int, daily_earned_so_far: int) ->
 
 # ── GAS SYNC ──────────────────────────────────────────────────────
 async def pull_from_gas(data: dict):
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(GAS_URL + "?action=read", allow_redirects=True) as resp:
-                text    = await resp.text()
-                members = json.loads(text)
-                if isinstance(members, list) and members:
-                    data["members"] = _sanitize_members(members)
-                    await save_data(data)
-                    return True
-    except Exception as e:
-        print(f"[GAS PULL ERROR] {e}")
-    return False
+    """MongoDB is primary — GAS is push-only backup."""
+    db = get_db()
+    if db is not None:
+        members_doc = await db["members"].find_one({"_id": "list"}) or {}
+        raw = members_doc.get("members", [])
+        if raw:
+            data["members"] = _sanitize_members(raw)
+            return True
+    return bool(data.get("members"))
 
-async def push_to_gas(data: dict):
+
+async def _push_members_to_gas_bg(data: dict):
+    """Push members to GAS in background — fire and forget backup."""
+    if not GAS_URL:
+        return
     try:
         payload = json.dumps({
             "action": "write",
@@ -430,17 +431,28 @@ async def push_to_gas(data: dict):
         })
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                GAS_URL,
-                data=payload,
-                headers={"Content-Type": "text/plain"}
+                GAS_URL, data=payload,
+                headers={"Content-Type": "text/plain"},
+                timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
-                print(f"[GAS PUSH] Status: {resp.status}")
-                return True
+                print(f"[GAS PUSH BG] Status: {resp.status}")
     except Exception as e:
-        print(f"[GAS PUSH ERROR] {e}")
-    return False
+        print(f"[GAS PUSH BG ERROR] {e}")
+
+async def push_to_gas(data: dict):
+    """GAS backup — fire and forget, non-blocking."""
+    asyncio.create_task(_push_members_to_gas_bg(data))
+    return True
 
 async def push_proof_to_gas(session_data: dict) -> bool:
+    """Push session proof to GAS in background — fire and forget."""
+    asyncio.create_task(_push_proof_to_gas_bg(session_data))
+    return True
+
+
+async def _push_proof_to_gas_bg(session_data: dict):
+    if not GAS_URL:
+        return
     try:
         payload = json.dumps({
             "action": "submitProof",
@@ -457,17 +469,23 @@ async def push_proof_to_gas(session_data: dict) -> bool:
         })
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                GAS_URL,
-                data=payload,
-                headers={"Content-Type": "text/plain"}
+                GAS_URL, data=payload,
+                headers={"Content-Type": "text/plain"},
+                timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
-                print(f"[GAS PROOF] Status: {resp.status}")
-                return resp.status == 200
+                print(f"[GAS PROOF BG] Status: {resp.status}")
     except Exception as e:
-        print(f"[GAS PROOF ERROR] {e}")
-    return False
+        print(f"[GAS PROOF BG ERROR] {e}")
 
 async def create_member_on_gas(member: dict) -> bool:
+    """Push new member to GAS in background — fire and forget."""
+    asyncio.create_task(_create_member_on_gas_bg(member))
+    return True
+
+
+async def _create_member_on_gas_bg(member: dict):
+    if not GAS_URL:
+        return
     try:
         payload = json.dumps({
             "action":    "create",
@@ -478,16 +496,14 @@ async def create_member_on_gas(member: dict) -> bool:
         })
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                GAS_URL,
-                data=payload,
-                headers={"Content-Type": "text/plain"}
+                GAS_URL, data=payload,
+                headers={"Content-Type": "text/plain"},
+                timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 text = await resp.text()
-                print(f"[GAS CREATE] Status: {resp.status} | Response: {text[:200]}")
-                return resp.status == 200
+                print(f"[GAS CREATE BG] Status: {resp.status} | {text[:100]}")
     except Exception as e:
-        print(f"[GAS CREATE ERROR] {e}")
-    return False
+        print(f"[GAS CREATE BG ERROR] {e}")
 
 # ── ACTIVE SESSION TIMER LOOP ─────────────────────────────────────
 _session_messages = {}   # uid -> discord.Message
@@ -2772,8 +2788,7 @@ async def echoes(interaction: discord.Interaction):
 
     member = get_member(shadow_id, data)
     if not member:
-        await pull_from_gas(data)
-        data   = await load_data()
+        data   = await load_data()  # refresh from MongoDB
         member = get_member(shadow_id, data)
 
     if not member:
@@ -2832,9 +2847,6 @@ async def leaderboard(interaction: discord.Interaction):
     await interaction.response.defer()
 
     data = await load_data()
-    if not data["members"]:
-        await pull_from_gas(data)
-        data = await load_data()
 
     sorted_m = sorted(data["members"], key=lambda m: int(m.get("echoCount", 0)), reverse=True)[:10]
 
@@ -3128,17 +3140,16 @@ async def sync_cmd(interaction: discord.Interaction):
     if not is_admin(interaction):
         await interaction.response.send_message(embed=make_embed("▲ CLEARANCE DENIED", "This command is restricted to those with high clearance.", color=0xE63946))
         return
-    await interaction.response.send_message(embed=make_embed("◉ SYNCING", "Fetching latest data from the archive...", color=0xA855F7))
+    await interaction.response.send_message(embed=make_embed("◉ SYNCING", "Loading operative data from MongoDB...", color=0xA855F7))
     data = await load_data()
-    ok   = await pull_from_gas(data)
-    data = await load_data()
-    if ok:
+    if data.get("members"):
         await interaction.followup.send(
-            embed=make_embed("◉ SYNC COMPLETE", f"**{len(data['members'])}** operatives loaded.", color=0x10B981),
+            embed=make_embed("◉ SYNC COMPLETE", f"**{len(data['members'])}** operatives loaded from MongoDB.", color=0x10B981),
         )
+        asyncio.create_task(_push_members_to_gas_bg(data))
     else:
         await interaction.followup.send(
-            embed=make_embed("▲ SYNC FAILED", "Could not reach the archive. Check the GAS URL.", color=0xE63946),
+            embed=make_embed("▲ NO DATA", "No operative records found in MongoDB.", color=0xE63946),
         )
 
 # ── /syncids ──────────────────────────────────────────────────────
@@ -3172,12 +3183,7 @@ async def syncids(interaction: discord.Interaction):
 
     data = await load_data()
     mongo_echo_cache = {m["shadowId"]: int(m.get("echoCount", 0)) for m in data["members"]}
-    await pull_from_gas(data)
-    data = await load_data()
-
-    for m in data["members"]:
-        if m["shadowId"] in mongo_echo_cache:
-            m["echoCount"] = mongo_echo_cache[m["shadowId"]]
+    # MongoDB is primary — no GAS fetch needed
 
     to_sync     = []
     id_to_label = {}
@@ -3641,7 +3647,7 @@ class TokenTierView(discord.ui.View):
 
             await interaction.response.defer()
 
-            from shadow_ai import gas_get_tokens, gas_set_tokens
+            from shadow_ai import d1_get_tokens, d1_set_tokens
             # Re-fetch live echo count
             data = await load_data()
             uid = self.uid
@@ -3665,9 +3671,9 @@ class TokenTierView(discord.ui.View):
             await push_to_gas(data)
 
             # Add tokens
-            current = await gas_get_tokens(uid) or 0
+            current = await d1_get_tokens(uid) or 0
             new_total = current + tier["tokens"]
-            await gas_set_tokens(uid, new_total)
+            await d1_set_tokens(uid, new_total)
 
             embed = make_embed(
                 "◈ TOKENS ACQUIRED",
@@ -3736,11 +3742,14 @@ async def on_message(message: discord.Message):
 
     uid = str(message.author.id)
 
-    # Ghost Guide: DM replies from users in active onboarding session
+    # DM handler — no ping needed in DMs
     if isinstance(message.channel, discord.DMChannel):
         if ghost_is_active(uid):
             await ghost_handle_dm(message, get_db)
             return
+        # Any DM message goes to Shadow AI — no ping required
+        await handle_mention(message, bot, load_data, save_data, get_db)
+        return
 
     # Channel-only session handlers (admin tools)
     if not isinstance(message.channel, discord.DMChannel):
@@ -4385,9 +4394,8 @@ async def on_ready():
         print(f"[SHADOW BOT] Sync error: {e}")
 
     data = await load_data()
-    await pull_from_gas(data)
     loaded = await load_data()
-    print(f"[SHADOW BOT] Loaded {len(loaded['members'])} members from GAS")
+    print(f"[SHADOW BOT] Loaded {len(loaded['members'])} members from MongoDB")
 
     # Ensure MongoDB TTL index for plan_cache (15 min expiry)
     await ensure_plan_ttl_index(get_db)
@@ -4396,9 +4404,9 @@ async def on_ready():
     try:
         for uid, link in loaded.get("links", {}).items():
             if link.get("approved"):
-                existing = await gas_get_tokens(uid)
+                existing = await d1_get_tokens(uid)
                 if existing is None:
-                    await gas_set_tokens(uid, LINKED_BONUS)
+                    await d1_set_tokens(uid, LINKED_BONUS)
                     print(f"[TOKENS] Seeded {LINKED_BONUS} tokens for existing member uid={uid}")
     except Exception as e:
         print(f"[TOKENS] Seeding error: {e}")

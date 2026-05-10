@@ -10,6 +10,9 @@ import asyncio
 import os
 import threading
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import uvicorn
 
 # ── Import the FastAPI app (void server) ──────────────────────────

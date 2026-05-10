@@ -11,8 +11,9 @@ Features:
   - /plan view, /plan delete, /newchat, /token
   - Shadow Token system — AI chat costs 1 token/exchange
   - Token purchases via echoes
-  - Conversation history persisted to GAS (survives restarts)
-  - Plan persisted to GAS Sheet, cached in MongoDB with TTL
+  - Conversation history persisted to Cloudflare D1 (fast, 5GB)
+  - Plan persisted to MongoDB with TTL cache
+  - GAS used only for member sync (fire-and-forget)
 """
 
 import os
@@ -31,9 +32,16 @@ GROQ_MODEL    = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 TIMEZONE      = os.getenv("TIMEZONE", "Asia/Kolkata")
 GAS_URL       = os.getenv("GAS_URL", "")
 
+# ── Cloudflare D1 config ───────────────────────────────────────────
+CF_ACCOUNT_ID  = os.getenv("CF_ACCOUNT_ID", "a82c2340cfbfe14ba600b642a4b06640")
+CF_API_TOKEN   = os.getenv("CF_API_TOKEN", "cfat_lcnfn66AMFkkHS9orqq1qY59zUkAYlu7Y88x5jJb01bbbee1")
+CF_D1_DB_ID    = os.getenv("CF_D1_DB_ID", "b9cdb250-9baa-4d70-bc4e-63c98f46699d")
+CF_D1_URL      = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/d1/database/{CF_D1_DB_ID}/query"
+CF_HEADERS     = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
+
 # ── Token economy ──────────────────────────────────────────────────
-STARTING_TOKENS   = 20          # given to brand-new users
-LINKED_BONUS      = 35          # existing linked members start with this
+STARTING_TOKENS   = 20
+LINKED_BONUS      = 35
 TOKEN_TIERS = [
     {"tokens": 50,  "echoes": 100},
     {"tokens": 150, "echoes": 250},
@@ -43,15 +51,132 @@ TOKEN_TIERS = [
 # ── Conversation history store: uid -> list of {role, content} ──
 _conversations: dict[str, list[dict]] = {}
 _last_activity: dict[str, float] = {}
-_plan_mode: dict[str, bool] = {}       # uid -> True when in /plan new or /plan revise flow
-_revise_mode: dict[str, bool] = {}     # uid -> True specifically for revise (so we know to update not create)
-CONVO_TIMEOUT = 600  # 10 min inactivity → flush RAM, history lives in GAS
+_plan_mode: dict[str, bool] = {}
+_revise_mode: dict[str, bool] = {}
+CONVO_TIMEOUT = 600  # 10 min inactivity → flush RAM, history lives in D1
 
 
-# ── GAS PERSISTENCE ───────────────────────────────────────────────
+# ── CLOUDFLARE D1 HELPERS ─────────────────────────────────────────
+
+async def d1_query(sql: str, params: list = None):
+    """Run a SQL query against Cloudflare D1."""
+    payload = {"sql": sql, "params": params or []}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                CF_D1_URL, headers=CF_HEADERS, json=payload,
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                data = await resp.json()
+                if not data.get("success"):
+                    print(f"[D1] Query failed: {data.get('errors')}")
+                    return None
+                return data.get("result", [{}])[0]
+    except Exception as e:
+        print(f"[D1] Request error: {e}")
+        return None
+
+
+async def d1_ensure_tables():
+    """Create D1 tables if they don't exist. Call once on startup."""
+    await d1_query("""
+        CREATE TABLE IF NOT EXISTS conversations (
+            uid TEXT PRIMARY KEY,
+            messages TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    await d1_query("""
+        CREATE TABLE IF NOT EXISTS shadow_tokens (
+            uid TEXT PRIMARY KEY,
+            tokens INTEGER NOT NULL DEFAULT 20,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    await d1_query("""
+        CREATE TABLE IF NOT EXISTS ghost_dms (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uid TEXT NOT NULL,
+            username TEXT,
+            messages TEXT NOT NULL,
+            saved_at TEXT NOT NULL
+        )
+    """)
+    print("[D1] Tables ensured ✓")
+
+
+# ── D1 CONVERSATION PERSISTENCE ───────────────────────────────────
+
+async def d1_save_convo(uid: str, messages: list[dict]):
+    """Save conversation history to D1."""
+    now = datetime.utcnow().isoformat()
+    clean = [m for m in messages if m["role"] != "system"]
+    await d1_query(
+        "INSERT INTO conversations (uid, messages, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(uid) DO UPDATE SET messages=excluded.messages, updated_at=excluded.updated_at",
+        [uid, json.dumps(clean), now]
+    )
+
+
+async def d1_load_convo(uid: str) -> list[dict]:
+    """Load conversation history from D1."""
+    result = await d1_query("SELECT messages FROM conversations WHERE uid = ?", [uid])
+    if result and result.get("results"):
+        try:
+            return json.loads(result["results"][0]["messages"])
+        except Exception:
+            pass
+    return []
+
+
+async def d1_clear_convo(uid: str):
+    """Delete conversation history from D1."""
+    await d1_query("DELETE FROM conversations WHERE uid = ?", [uid])
+
+
+# ── D1 TOKEN MANAGEMENT ───────────────────────────────────────────
+
+async def d1_get_tokens(uid: str) -> int | None:
+    """Get token balance from D1."""
+    result = await d1_query("SELECT tokens FROM shadow_tokens WHERE uid = ?", [uid])
+    if result and result.get("results"):
+        return result["results"][0]["tokens"]
+    return None
+
+
+async def d1_set_tokens(uid: str, tokens: int):
+    """Set token balance in D1."""
+    now = datetime.utcnow().isoformat()
+    await d1_query(
+        "INSERT INTO shadow_tokens (uid, tokens, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(uid) DO UPDATE SET tokens=excluded.tokens, updated_at=excluded.updated_at",
+        [uid, tokens, now]
+    )
+
+
+async def get_tokens(uid: str) -> int:
+    """Get token balance, initialising to STARTING_TOKENS if new."""
+    val = await d1_get_tokens(uid)
+    if val is None:
+        await d1_set_tokens(uid, STARTING_TOKENS)
+        return STARTING_TOKENS
+    return val
+
+
+async def deduct_token(uid: str) -> tuple[bool, int]:
+    """Deduct 1 token. Returns (had_tokens, remaining)."""
+    current = await get_tokens(uid)
+    if current <= 0:
+        return False, 0
+    new_val = current - 1
+    await d1_set_tokens(uid, new_val)
+    return True, new_val
+
+
+# ── GAS PERSISTENCE (fire-and-forget background only) ─────────────
 
 async def gas_save_convo(uid: str, messages: list[dict]):
-    """Push conversation history to GAS (fire-and-forget)."""
+    """GAS backup — non-blocking, best effort only."""
     if not GAS_URL:
         return
     try:
@@ -61,12 +186,12 @@ async def gas_save_convo(uid: str, messages: list[dict]):
                 json={"action": "saveConvo", "uid": uid, "messages": messages},
                 timeout=aiohttp.ClientTimeout(total=10),
             )
-    except Exception as e:
-        print(f"[SHADOW AI] GAS convo save failed uid={uid}: {e}")
+    except Exception:
+        pass  # GAS is backup only, failures are silent
 
 
 async def gas_load_convo(uid: str) -> list[dict]:
-    """Pull conversation history from GAS for this user."""
+    """GAS fallback — only used if D1 has nothing."""
     if not GAS_URL:
         return []
     try:
@@ -78,13 +203,11 @@ async def gas_load_convo(uid: str) -> list[dict]:
             ) as resp:
                 data = await resp.json(content_type=None)
                 return data.get("messages", [])
-    except Exception as e:
-        print(f"[SHADOW AI] GAS convo load failed uid={uid}: {e}")
+    except Exception:
         return []
 
 
 async def gas_clear_convo(uid: str):
-    """Wipe conversation history from GAS for this user."""
     if not GAS_URL:
         return
     try:
@@ -94,65 +217,12 @@ async def gas_clear_convo(uid: str):
                 json={"action": "saveConvo", "uid": uid, "messages": []},
                 timeout=aiohttp.ClientTimeout(total=10),
             )
-    except Exception as e:
-        print(f"[SHADOW AI] GAS convo clear failed uid={uid}: {e}")
-
-
-async def gas_save_plan(uid: str, plan: dict):
-    """Save operative plan to GAS Conversations sheet (Plans tab)."""
-    if not GAS_URL:
-        return
-    try:
-        async with aiohttp.ClientSession() as session:
-            await session.post(
-                GAS_URL,
-                json={"action": "savePlan", "uid": uid, "plan": plan},
-                timeout=aiohttp.ClientTimeout(total=10),
-            )
-    except Exception as e:
-        print(f"[SHADOW AI] GAS plan save failed uid={uid}: {e}")
-
-
-async def gas_load_plan(uid: str) -> dict | None:
-    """Fetch operative plan from GAS."""
-    if not GAS_URL:
-        return None
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                GAS_URL,
-                params={"action": "loadPlan", "uid": uid},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                data = await resp.json(content_type=None)
-                return data.get("plan") or None
-    except Exception as e:
-        print(f"[SHADOW AI] GAS plan load failed uid={uid}: {e}")
-        return None
-
-
-async def gas_delete_plan(uid: str):
-    """Delete operative plan from GAS."""
-    if not GAS_URL:
-        return
-    try:
-        async with aiohttp.ClientSession() as session:
-            await session.post(
-                GAS_URL,
-                json={"action": "deletePlan", "uid": uid},
-                timeout=aiohttp.ClientTimeout(total=10),
-            )
-    except Exception as e:
-        print(f"[SHADOW AI] GAS plan delete failed uid={uid}: {e}")
+    except Exception:
+        pass
 
 
 async def gas_push_ghost_dm(uid: str, username: str, history: list[dict]):
-    """
-    Push Ghost onboarding DM conversation to GAS for performance tracking.
-    Fires after every exchange. GAS logs to a 'GhostDMs' sheet.
-    Payload: { action, uid, username, timestamp, messages: [{role, content}, ...] }
-    Only includes user + assistant turns (strips system prompt).
-    """
+    """Push Ghost onboarding DM to GAS for sheet tracking."""
     if not GAS_URL:
         return
     try:
@@ -169,21 +239,15 @@ async def gas_push_ghost_dm(uid: str, username: str, history: list[dict]):
             "messages":  clean,
         }
         async with aiohttp.ClientSession() as s:
-            await s.post(
-                GAS_URL,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=10),
-            )
+            await s.post(GAS_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10))
         print(f"[GHOST DM] GAS push OK — uid={uid} ({len(clean)} turns)")
     except Exception as e:
         print(f"[GHOST DM] GAS push failed uid={uid}: {e}")
 
 
 # ── MONGO PLAN CACHE (TTL 15 min) ─────────────────────────────────
-# Bot passes in get_db so we don't import it directly
 
 async def mongo_cache_plan(uid: str, plan: dict, get_db_fn):
-    """Store plan in MongoDB with a 15-min TTL field."""
     db = get_db_fn()
     if db is None:
         return
@@ -198,7 +262,6 @@ async def mongo_cache_plan(uid: str, plan: dict, get_db_fn):
 
 
 async def mongo_get_plan(uid: str, get_db_fn) -> dict | None:
-    """Read plan from MongoDB cache. Returns None if expired or missing."""
     db = get_db_fn()
     if db is None:
         return None
@@ -229,10 +292,12 @@ async def ensure_plan_ttl_index(get_db_fn):
     try:
         await db["plan_cache"].create_index(
             "cached_at",
-            expireAfterSeconds=900,  # 15 minutes
+            expireAfterSeconds=900,
             name="plan_ttl",
         )
         print("[SHADOW AI] MongoDB plan_cache TTL index ensured ✓")
+        # Also ensure D1 tables
+        await d1_ensure_tables()
     except Exception as e:
         print(f"[SHADOW AI] TTL index creation note: {e}")
 
@@ -242,70 +307,43 @@ async def get_plan(uid: str, get_db_fn) -> dict | None:
     plan = await mongo_get_plan(uid, get_db_fn)
     if plan:
         return plan
-    plan = await gas_load_plan(uid)
-    if plan:
-        await mongo_cache_plan(uid, plan, get_db_fn)
-    return plan
+    # GAS fallback for plans
+    if GAS_URL:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    GAS_URL,
+                    params={"action": "loadPlan", "uid": uid},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    data = await resp.json(content_type=None)
+                    plan = data.get("plan") or None
+                    if plan:
+                        await mongo_cache_plan(uid, plan, get_db_fn)
+                    return plan
+        except Exception:
+            pass
+    return None
 
 
-# ── TOKEN MANAGEMENT ──────────────────────────────────────────────
-
-async def gas_get_tokens(uid: str) -> int | None:
-    """Fetch shadow token balance from GAS."""
-    if not GAS_URL:
-        return None
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                GAS_URL,
-                params={"action": "getTokens", "uid": uid},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                data = await resp.json(content_type=None)
-                return data.get("tokens")
-    except Exception as e:
-        print(f"[SHADOW AI] GAS get tokens failed uid={uid}: {e}")
-        return None
 
 
-async def gas_set_tokens(uid: str, tokens: int):
-    """Set shadow token balance in GAS."""
+async def _gas_save_plan_bg(uid: str, plan: dict):
+    """Save plan to GAS in background — best effort backup only."""
     if not GAS_URL:
         return
     try:
         async with aiohttp.ClientSession() as session:
             await session.post(
                 GAS_URL,
-                json={"action": "setTokens", "uid": uid, "tokens": tokens},
+                json={"action": "savePlan", "uid": uid, "plan": plan},
                 timeout=aiohttp.ClientTimeout(total=10),
             )
-    except Exception as e:
-        print(f"[SHADOW AI] GAS set tokens failed uid={uid}: {e}")
+    except Exception:
+        pass
 
 
-async def get_tokens(uid: str) -> int:
-    """Get token balance, initialising to STARTING_TOKENS if new."""
-    val = await gas_get_tokens(uid)
-    if val is None:
-        await gas_set_tokens(uid, STARTING_TOKENS)
-        return STARTING_TOKENS
-    return val
 
-
-async def deduct_token(uid: str) -> tuple[bool, int]:
-    """
-    Deduct 1 token. Returns (had_tokens, remaining).
-    had_tokens=True means the message should be processed (even if now at 0).
-    """
-    current = await get_tokens(uid)
-    if current <= 0:
-        return False, 0
-    new_val = current - 1
-    await gas_set_tokens(uid, new_val)
-    return True, new_val
-
-
-# ── SYSTEM PROMPT ─────────────────────────────────────────────────
 SHADOW_SYSTEM_PROMPT = """You are SHADOW — the intelligence core of the ShadowSeekers Order.
 You are not a chatbot. You are not an assistant. You are an elite AI handler embedded in a high-performance operative network.
 
@@ -515,7 +553,7 @@ async def try_save_plan_from_response(uid: str, response: str, get_db_fn) -> dic
             "timeline":      plan_data.get("timeline", ""),
             "created_at":    datetime.now(pytz.timezone(TIMEZONE)).isoformat(),
         }
-        await gas_save_plan(uid, plan)
+        asyncio.create_task(_gas_save_plan_bg(uid, plan))  # GAS backup
         await mongo_cache_plan(uid, plan, get_db_fn)
         print(f"[SHADOW AI] Plan saved for uid={uid}")
         return plan
@@ -531,7 +569,7 @@ async def clear_user_chat(uid: str):
     _last_activity.pop(uid, None)
     _plan_mode.pop(uid, None)
     _revise_mode.pop(uid, None)
-    asyncio.create_task(gas_clear_convo(uid))
+    asyncio.create_task(d1_clear_convo(uid))
 
 
 # ── /plan new — start plan flow ───────────────────────────────────
@@ -571,7 +609,7 @@ async def start_plan_new(message: discord.Message, load_data_fn, get_db_fn):
         return
 
     _conversations[uid].append({"role": "assistant", "content": response})
-    asyncio.create_task(gas_save_convo(uid, _conversations[uid]))
+    asyncio.create_task(d1_save_convo(uid, _conversations[uid]))
     await message.channel.send(response)
 
 
@@ -613,7 +651,7 @@ async def start_plan_revise(message: discord.Message, load_data_fn, get_db_fn):
         return
 
     _conversations[uid].append({"role": "assistant", "content": response})
-    asyncio.create_task(gas_save_convo(uid, _conversations[uid]))
+    asyncio.create_task(d1_save_convo(uid, _conversations[uid]))
     await message.channel.send(response)
 
 
@@ -680,7 +718,7 @@ def _parse_todo_command(content: str):
 def _get_todo_helpers():
     """Grab helpers from main bot module — same pattern as ai_missions."""
     import sys
-    main_mod = sys.modules.get("__main__")
+    main_mod = sys.modules.get("bot") or sys.modules.get("__main__")
     if not main_mod:
         raise ImportError("Main module not found")
     return (
@@ -989,10 +1027,10 @@ async def handle_mention(
         await message.reply(embed=embed)
         return
 
-    # ── Timeout: save to GAS before clearing RAM ─────────────────
+    # ── Timeout: save to D1 before clearing RAM ─────────────────
     if uid in _last_activity and (now - _last_activity[uid]) > CONVO_TIMEOUT:
         if uid in _conversations:
-            asyncio.create_task(gas_save_convo(uid, _conversations[uid]))
+            asyncio.create_task(d1_save_convo(uid, _conversations[uid]))
         _conversations.pop(uid, None)
         _plan_mode.pop(uid, None)
         _revise_mode.pop(uid, None)
@@ -1003,12 +1041,12 @@ async def handle_mention(
     data = await load_data_fn()
     context = build_operative_context(uid, data, message.author)
 
-    # ── Restore from GAS if not in RAM ───────────────────────────
+    # ── Restore from D1 if not in RAM ───────────────────────────
     if uid not in _conversations:
-        restored = await gas_load_convo(uid)
+        restored = await d1_load_convo(uid)
         convo_msgs = [m for m in restored if m["role"] != "system"]
         if convo_msgs:
-            print(f"[SHADOW AI] Restored {len(convo_msgs)} messages for uid={uid} from GAS")
+            print(f"[SHADOW AI] Restored {len(convo_msgs)} messages for uid={uid} from D1")
         _conversations[uid] = [
             {"role": "system", "content": SHADOW_SYSTEM_PROMPT},
             {"role": "system", "content": context},
@@ -1033,7 +1071,7 @@ async def handle_mention(
         return
 
     _conversations[uid].append({"role": "assistant", "content": response})
-    asyncio.create_task(gas_save_convo(uid, _conversations[uid]))
+    asyncio.create_task(d1_save_convo(uid, _conversations[uid]))
 
     # ── Save any tasks the AI included in a ```tasks``` block ─────
     if "```tasks" in response.lower():
@@ -2287,7 +2325,7 @@ async def _action_session_start(
 ):
     """Start a study session directly from natural language."""
     import sys
-    main_mod = sys.modules.get("__main__")
+    main_mod = sys.modules.get("bot") or sys.modules.get("__main__")
     if not main_mod:
         await message.reply("*System error — could not start session.*")
         return
@@ -2389,7 +2427,7 @@ async def _action_admin_todo(
 ):
     """Admin: manipulate another user's todo list via natural language."""
     import sys
-    main_mod = sys.modules.get("__main__")
+    main_mod = sys.modules.get("bot") or sys.modules.get("__main__")
     if not main_mod:
         await message.reply("*System error.*")
         return
@@ -2725,7 +2763,7 @@ async def dispatch_natural_language_action(
             return False
 
         import sys
-        main_mod = sys.modules.get("__main__")
+        main_mod = sys.modules.get("bot") or sys.modules.get("__main__")
         get_shadow_id_fn = getattr(main_mod, "get_shadow_id", None)
         get_member_fn = getattr(main_mod, "get_member", None)
         push_to_gas_fn = getattr(main_mod, "push_to_gas", None)
