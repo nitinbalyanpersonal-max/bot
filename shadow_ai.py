@@ -496,7 +496,10 @@ Recent study sessions:
 {sess_block}
 
 Upcoming exams:
-{exam_block}"""
+{exam_block}
+
+Long-term memory (use naturally, don't recite):
+__MEMORY_PLACEHOLDER__{uid}__"""
 
 
 # ── CALL GROQ ─────────────────────────────────────────────────────
@@ -1041,6 +1044,16 @@ async def handle_mention(
     data = await load_data_fn()
     context = build_operative_context(uid, data, message.author)
 
+    # ── Inject long-term memory ───────────────────────────────────
+    placeholder = f"__MEMORY_PLACEHOLDER__{uid}__"
+    if placeholder in context:
+        try:
+            from shadow_brain import memory_format_for_prompt
+            memory_block = await memory_format_for_prompt(uid)
+        except ImportError:
+            memory_block = "  Memory system not loaded."
+        context = context.replace(placeholder, memory_block)
+
     # ── Restore from D1 if not in RAM ───────────────────────────
     if uid not in _conversations:
         restored = await d1_load_convo(uid)
@@ -1072,6 +1085,17 @@ async def handle_mention(
 
     _conversations[uid].append({"role": "assistant", "content": response})
     asyncio.create_task(d1_save_convo(uid, _conversations[uid]))
+
+    # ── Auto-extract memory from this conversation (fire-and-forget) ──
+    try:
+        from shadow_brain import auto_extract_memory, save_extracted_memories
+        async def _extract_and_save():
+            notes = await auto_extract_memory(uid, _conversations[uid])
+            if notes:
+                await save_extracted_memories(uid, notes)
+        asyncio.create_task(_extract_and_save())
+    except ImportError:
+        pass
 
     # ── Save any tasks the AI included in a ```tasks``` block ─────
     if "```tasks" in response.lower():

@@ -34,8 +34,7 @@ MISSION_GEN_MIN   = int(os.getenv("MISSION_GEN_MIN", "0"))
 TIMEZONE          = os.getenv("TIMEZONE", "Asia/Kolkata")
 
 _pending_missions: dict[str, list[str]] = {}
-# UIDs who opted out of daily AI mission broadcasts
-_mission_optouts: set[str] = set()
+# Opt-in state is managed by shadow_brain — import helpers at runtime to avoid circular deps
 
 
 async def _resolve_mission_target(guild: discord.Guild) -> discord.abc.Messageable | None:
@@ -415,9 +414,13 @@ async def ai_mission_task():
         print(f"[AI MISSIONS] Generating for {len(approved_uids)} operatives...")
 
         for uid in approved_uids:
-            # Skip opted-out users
-            if uid in _mission_optouts:
-                continue
+            # Only broadcast to users who explicitly opted IN
+            try:
+                from shadow_brain import is_mission_opted_in
+                if not is_mission_opted_in(uid):
+                    continue
+            except ImportError:
+                pass  # if brain not loaded, skip all (safe default)
             try:
                 await asyncio.sleep(1.5)
                 ctx = build_rich_context(uid, data)
@@ -580,51 +583,8 @@ def register_commands(tree: app_commands.CommandTree):
             color=0xA855F7,
         ).set_footer(text="☽ SHADOWSEEKERS ORDER · AI MISSION ENGINE"))
 
-    @tree.command(name="stopmissions", description="Opt out of daily AI mission broadcasts — use /startmissions to re-enable")
-    async def stopmissions(interaction: discord.Interaction):
-        uid = str(interaction.user.id)
-        if uid in _mission_optouts:
-            await interaction.response.send_message(embed=discord.Embed(
-                title="◈ ALREADY OPTED OUT",
-                description="You're already off the daily mission broadcast.\nUse `/startmissions` to re-enable.",
-                color=0x6B6B9A,
-            ).set_footer(text="☽ SHADOWSEEKERS ORDER · AI MISSION ENGINE"),
-            ephemeral=True)
-            return
-        _mission_optouts.add(uid)
-        await interaction.response.send_message(embed=discord.Embed(
-            title="🔕 MISSION BROADCASTS STOPPED",
-            description=(
-                "You won't receive daily AI mission pings anymore.\n\n"
-                "◈ You can still use `/generatemissions` anytime to generate on-demand.\n"
-                "◈ Use `/startmissions` to re-enable broadcasts."
-            ),
-            color=0xF0A500,
-        ).set_footer(text="☽ SHADOWSEEKERS ORDER · AI MISSION ENGINE"),
-        ephemeral=True)
-
-    @tree.command(name="startmissions", description="Re-enable daily AI mission broadcasts after using /stopmissions")
-    async def startmissions(interaction: discord.Interaction):
-        uid = str(interaction.user.id)
-        if uid not in _mission_optouts:
-            await interaction.response.send_message(embed=discord.Embed(
-                title="◈ ALREADY ACTIVE",
-                description="You're already receiving daily mission broadcasts.",
-                color=0x10B981,
-            ).set_footer(text="☽ SHADOWSEEKERS ORDER · AI MISSION ENGINE"),
-            ephemeral=True)
-            return
-        _mission_optouts.discard(uid)
-        await interaction.response.send_message(embed=discord.Embed(
-            title="🔔 MISSION BROADCASTS ENABLED",
-            description=(
-                "You're back on the daily mission roster.\n\n"
-                "◈ Next broadcast arrives at the scheduled time.\n"
-                "◈ Use `/stopmissions` anytime to opt out again."
-            ),
-            color=0x10B981,
-        ).set_footer(text="☽ SHADOWSEEKERS ORDER · AI MISSION ENGINE"),
-        ephemeral=True)
+    # /startmissions and /stopmissions are now handled by shadow_brain.py
+    # which persists opt-in state to D1 (survives restarts)
 
 
 # ── SETUP ─────────────────────────────────────────────────────────

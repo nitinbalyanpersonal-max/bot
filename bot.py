@@ -4372,6 +4372,13 @@ async def on_ready():
     setup_ai_missions(bot, tree)
     setup_shadow_ai(bot)
 
+    # ── Shadow Brain — autonomous thinking loop ───────────────────
+    try:
+        from shadow_brain import start_shadow_brain
+        await start_shadow_brain(bot, tree)
+    except Exception as e:
+        print(f"[SHADOW BOT] Shadow Brain init failed: {e}")
+
     # Set bot presence so it shows Online, not Completed
     await bot.change_presence(
         status=discord.Status.online,
